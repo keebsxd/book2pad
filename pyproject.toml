@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "book2pad"
+dynamic = ["version"]
+description = "Transfer PDF and EPUB books from Linux to an iPad's iBooks library"
+readme = "README.rst"
+requires-python = ">=3.8"
+authors = [{ name = "Ruikai Liu", email = "lrk700@gmail.com" }]
+
+[project.optional-dependencies]
+pdf = ["pypdf"]
+
+[project.scripts]
+book2pad = "book2pad.cli:main"
+
+[project.gui-scripts]
+book2pad-gui = "book2pad.gui:main"
+
+[tool.setuptools]
+packages = ["book2pad"]
+
+[tool.setuptools.dynamic]
+version = { attr = "book2pad.__version__" }
