@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=book2pad
+Comment=Transfer PDF and EPUB books to an iPad
+Exec=book2pad-gui
+Icon=x-office-document
+Terminal=false
+Categories=Office;Utility;

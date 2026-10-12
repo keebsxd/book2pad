@@ -89,9 +89,8 @@ def _pdf_metadata(path):
 
 
 def _looks_garbled(author):
-    # Long unbroken alphanumeric runs are usually IDs, not names.
-    match = re.search(r'[A-Za-z0-9]+', author)
-    return bool(match and len(match.group(0)) > 10)
+    # Long letter+digit runs (e.g. "A1B2C3D4E5F6") are IDs, not names.
+    return bool(re.search(r'(?=[A-Za-z]*\d)(?=\d*[A-Za-z])[A-Za-z0-9]{11,}', author))
 
 
 def read_book_info(path, with_hash=True):
@@ -109,10 +108,10 @@ def read_book_info(path, with_hash=True):
             title, author = _pdf_metadata(path)
     except Exception:
         pass  # unreadable metadata just means we use the filename
-    if not title or not author or _looks_garbled(author):
-        fn_title, fn_author = parse_filename(path)
-        title = title or fn_title
-        author = author if author and not _looks_garbled(author) else fn_author
+    fn_title, fn_author = parse_filename(path)
+    if _looks_garbled(author):
+        author = ''
+    title, author = title or fn_title, author or fn_author
     info.title, info.author = title, author
     if with_hash:
         info.hash = hash_md5(path)
@@ -136,6 +135,12 @@ def collect_books(paths):
 # --------------------------------------------------------------------------
 # The iPad side: Purchases.plist
 # --------------------------------------------------------------------------
+
+def _safe_name(path):
+    """Basename of a library entry's Path, or None if it can't be a book file."""
+    name = os.path.basename(str(path).rstrip('/'))
+    return name if name not in ('', '.', '..', os.path.basename(PLIST_REL)) else None
+
 
 def check_mount(mount):
     purchases = os.path.join(mount, 'Books', 'Purchases')
@@ -169,11 +174,17 @@ class Library:
                     self.tree = plistlib.loads(data)
                 except Exception as e:
                     raise Book2PadError('Cannot read %s: %s' % (self.plist_path, e))
-        self.books = {os.path.basename(b['Path']): b
-                      for b in self.tree.get('Books', []) if 'Path' in b}
+        self.books = {}
+        self.foreign = []  # entries we can't key by filename; kept untouched
+        for b in self.tree.get('Books', []):
+            name = _safe_name(b.get('Path', '')) if isinstance(b, dict) else None
+            if name:
+                self.books[name] = b
+            else:
+                self.foreign.append(b)
 
     def save(self):
-        self.tree['Books'] = list(self.books.values())
+        self.tree['Books'] = list(self.books.values()) + self.foreign
         tmp = self.plist_path + PARTIAL_SUFFIX
         try:
             with open(tmp, 'wb') as f:
@@ -205,8 +216,8 @@ class Library:
 
     def remove(self, filename, delete_file=True):
         rec = self.books.pop(filename, None)
-        if rec and delete_file:
-            _rm(os.path.join(self.dest, os.path.basename(rec['Path'])))
+        if rec and delete_file and _safe_name(filename) == filename:
+            _rm(os.path.join(self.dest, filename))
         return rec
 
     def cleanup_partials(self):
@@ -279,8 +290,10 @@ def _install(info, dest):
 
 def transfer_one(library, info):
     """Transfer a single book; ``info`` must include its hash."""
-    if info.ext not in SUPPORTED_EXTS or not os.path.isfile(info.path):
+    if info.ext not in SUPPORTED_EXTS:
         return Result(info.path, Status.UNSUPPORTED)
+    if not os.path.isfile(info.path):
+        return Result(info.path, Status.FAILED, 'file not found')
     if library.is_current(info):
         return Result(info.path, Status.EXISTS)
     old = library.get(info.filename)
@@ -306,6 +319,7 @@ def transfer(library, books, progress=None, cancel=None, overrides=None):
     overrides = overrides or {}
     summary = Summary()
     total = len(books)
+    seen = {}  # filename -> path; the iPad stores books by filename only
     try:
         for i, path in enumerate(books):
             if cancel.is_set():
@@ -313,20 +327,30 @@ def transfer(library, books, progress=None, cancel=None, overrides=None):
                 break
             if progress:
                 progress(i, total, path, None)
+            name = os.path.basename(path)
             try:
-                if path.lower().endswith(SUPPORTED_EXTS) and os.path.isfile(path):
+                if not path.lower().endswith(SUPPORTED_EXTS):
+                    result = Result(path, Status.UNSUPPORTED)
+                elif not os.path.isfile(path):
+                    result = Result(path, Status.FAILED, 'file not found')
+                elif name in seen:
+                    result = Result(path, Status.FAILED, 'same filename as %s; rename one'
+                                    % seen[name])
+                else:
+                    seen[name] = path
                     info = read_book_info(path)
                     for k, v in overrides.get(path, {}).items():
                         setattr(info, k, v)
                     result = transfer_one(library, info)
-                else:
-                    result = Result(path, Status.UNSUPPORTED)
             except Exception as e:
                 result = Result(path, Status.FAILED, str(e))
             summary.results.append(result)
             if progress:
                 progress(i + 1, total, path, result)
     finally:
-        library.cleanup_partials()
+        try:
+            library.cleanup_partials()
+        except OSError:
+            pass
         library.save()
     return summary

@@ -61,12 +61,14 @@ class App(ttk.Frame):
         self.cancel = None
         self.busy = False
         self.meta = {}          # path -> {'title', 'author', 'genre'}
+        self.quit_when_done = False
         self.mount_var = tk.StringVar(value=mount or DEFAULT_MOUNT)
         self.status_var = tk.StringVar()
         self.lib_var = tk.StringVar(value='Not connected')
 
         root.title('book2pad %s' % __version__)
         root.minsize(760, 460)
+        root.protocol('WM_DELETE_WINDOW', self.on_close)
         self.pack(fill='both', expand=True)
         self.build()
         self.poll()
@@ -170,7 +172,12 @@ class App(ttk.Frame):
                 fn(*args)
         except queue.Empty:
             pass
-        self.root.after(80, self.poll)
+        except tk.TclError:
+            return  # window was closed by one of the callbacks
+        try:
+            self.root.after(80, self.poll)
+        except tk.TclError:
+            pass
 
     def run_bg(self, fn, *args):
         threading.Thread(target=fn, args=args, daemon=True).start()
@@ -183,13 +190,16 @@ class App(ttk.Frame):
             self.mount_var.set(path)
             self.connect()
 
+    def mount_path(self):
+        return os.path.expanduser(self.mount_var.get().strip())
+
     def is_mounted(self):
-        return os.path.ismount(self.mount_var.get())
+        return os.path.ismount(self.mount_path())
 
     def connect(self, quiet=False):
         if self.busy:
             return
-        mount = os.path.expanduser(self.mount_var.get().strip())
+        mount = self.mount_path()
         self.libtree.delete(*self.libtree.get_children())
         self.library = None
         try:
@@ -210,21 +220,37 @@ class App(ttk.Frame):
         self.update_status()
 
     def toggle_mount(self):
-        mount = os.path.expanduser(self.mount_var.get().strip())
-        if self.is_mounted():
-            cmd = ['fusermount', '-u', mount]
+        mount = self.mount_path()
+        unmounting = self.is_mounted()
+        if unmounting:
+            tool = next((t for t in ('fusermount3', 'fusermount') if shutil.which(t)), None)
+            cmd = [tool, '-u', mount] if tool else ['umount', mount]
         else:
             if not shutil.which('ifuse'):
-                messagebox.showerror('book2pad', 'ifuse is not installed. Install it from '
-                                     'your package manager (libimobiledevice).')
+                messagebox.showerror('book2pad', 'ifuse is not installed.\n\nInstall it with '
+                                     'your package manager, e.g. "sudo pacman -S ifuse" or '
+                                     '"sudo apt install ifuse".')
                 return
-            os.makedirs(mount, exist_ok=True)
+            try:
+                os.makedirs(mount, exist_ok=True)
+            except OSError as e:
+                messagebox.showerror('book2pad', 'Cannot create %s:\n%s' % (mount, e))
+                return
             cmd = ['ifuse', mount]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode:
-            messagebox.showerror('book2pad', '%s failed:\n%s' % (cmd[0], proc.stderr.strip()
-                                 or 'exit code %d' % proc.returncode))
-        self.connect(quiet=cmd[0] == 'fusermount')
+        self.root.config(cursor='watch')
+        self.root.update_idletasks()
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            error = proc.returncode and (proc.stderr.strip() or 'exit code %d' % proc.returncode)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            error = str(e)
+        finally:
+            self.root.config(cursor='')
+        if error:
+            hint = '' if unmounting else ('\n\nMake sure the iPad is plugged in, unlocked, and '
+                                          'that you tapped "Trust" on it.')
+            messagebox.showerror('book2pad', '%s failed:\n%s%s' % (cmd[0], error, hint))
+        self.connect(quiet=unmounting or bool(error))
 
     # ---- queue ------------------------------------------------------------
 
@@ -371,8 +397,19 @@ class App(ttk.Frame):
             self.cancel.set()
             self.status_var.set('Cancelling after the current book…')
 
+    def on_close(self):
+        if not self.busy:
+            self.root.destroy()
+        elif messagebox.askyesno('book2pad', 'A transfer is in progress. Stop after the '
+                                 'current book and quit?'):
+            self.quit_when_done = True
+            self.cancel_transfer()
+
     def on_done(self, summary, error):
         self.set_busy(False)
+        if self.quit_when_done:
+            self.root.destroy()
+            return
         if error:
             messagebox.showerror('book2pad', 'Transfer failed:\n%s' % error)
         else:
